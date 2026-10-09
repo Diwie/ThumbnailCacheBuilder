@@ -4,12 +4,14 @@ param()
 $ErrorActionPreference = 'Stop'
 $thumbnailProviderAssociationIid = '{E357FCCD-A995-4576-B01F-234630154E96}'
 $extractImageAssociationIid = '{BB2E617C-0920-11D1-9A0B-00C04FC2D6C1}'
+$windowsPhotoThumbnailProviderClsid = '{C7657C4A-9F68-40FA-A4DF-96BC08EB3551}'
 
 if (-not ('ThumbnailCacheBuilder.WorkerNative' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
 using System.Text;
 using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
 
 namespace ThumbnailCacheBuilder {
   [StructLayout(LayoutKind.Sequential)]
@@ -51,6 +53,11 @@ namespace ThumbnailCacheBuilder {
     [PreserveSig] int Initialize([MarshalAs(UnmanagedType.LPWStr)] string filePath, uint mode);
   }
 
+  [ComImport, Guid("B824B49D-22AC-4161-AC8A-9916E8FA3F7F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  public interface IWorkerInitializeWithStream {
+    [PreserveSig] int Initialize([MarshalAs(UnmanagedType.Interface)] IStream stream, uint mode);
+  }
+
   [ComImport, Guid("0000010B-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
   public interface IWorkerPersistFile {
     [PreserveSig] int GetClassID(out Guid classId);
@@ -67,6 +74,7 @@ namespace ThumbnailCacheBuilder {
     const uint IEIFLAG_SCREEN = 0x20;
     const uint IEIFLAG_QUALITY = 0x200;
     const uint STGM_READ = 0;
+    const uint STGM_SHARE_DENY_WRITE = 0x20;
 
     static readonly Guid CLSID_LocalThumbnailCache = new Guid("50EF4544-AC9F-4A8E-B21B-8A26180DB13F");
     static readonly Guid BHID_ThumbnailHandler = new Guid("7B2E650A-8E20-4F4A-B09E-6597AFC72FB0");
@@ -79,6 +87,12 @@ namespace ThumbnailCacheBuilder {
     [DllImport("shell32.dll", CharSet=CharSet.Unicode, PreserveSig=true, EntryPoint="SHCreateItemFromParsingName")]
     static extern int SHCreateShellItem(string path, IntPtr ctx, ref Guid iid,
       [MarshalAs(UnmanagedType.Interface)] out IWorkerShellItem item);
+
+    [DllImport("shlwapi.dll", CharSet=CharSet.Unicode, PreserveSig=true)]
+    static extern int SHCreateStreamOnFileEx(
+      string path, uint mode, uint attributes, bool create,
+      [MarshalAs(UnmanagedType.Interface)] IStream templateStream,
+      [MarshalAs(UnmanagedType.Interface)] out IStream stream);
 
     [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr handle);
 
@@ -220,6 +234,40 @@ namespace ThumbnailCacheBuilder {
       }
     }
 
+    public static int RequestStreamThumbnailProvider(string path, int size, string clsidText) {
+      object handler = null;
+      IWorkerThumbnailProvider provider = null;
+      IWorkerInitializeWithStream initializer = null;
+      IStream stream = null;
+      IntPtr bitmap = IntPtr.Zero;
+      try {
+        Guid clsid;
+        if (!Guid.TryParse(clsidText, out clsid)) return unchecked((int)0x80070057);
+        Type t = Type.GetTypeFromCLSID(clsid, true);
+        handler = Activator.CreateInstance(t);
+        provider = handler as IWorkerThumbnailProvider;
+        initializer = handler as IWorkerInitializeWithStream;
+        if (provider == null || initializer == null) return unchecked((int)0x80004002);
+
+        uint mode = STGM_READ | STGM_SHARE_DENY_WRITE;
+        int hr = SHCreateStreamOnFileEx(path, mode, 0, false, null, out stream);
+        if (hr < 0 || stream == null) return hr < 0 ? hr : unchecked((int)0x80004005);
+
+        hr = initializer.Initialize(stream, mode);
+        if (hr < 0) return hr;
+
+        uint alphaType;
+        return provider.GetThumbnail((uint)size, out bitmap, out alphaType);
+      } catch (COMException ex) { return ex.ErrorCode; }
+        catch { return unchecked((int)0x80004005); }
+      finally {
+        if (bitmap != IntPtr.Zero) DeleteObject(bitmap);
+        if (stream != null && Marshal.IsComObject(stream)) Marshal.ReleaseComObject(stream);
+        if (provider != null && Marshal.IsComObject(provider)) Marshal.ReleaseComObject(provider);
+        else if (handler != null && Marshal.IsComObject(handler)) Marshal.ReleaseComObject(handler);
+      }
+    }
+
     public static int RequestDirectExtractImage(string path, int size, string clsidText) {
       object handler = null;
       IWorkerExtractImage extractor = null;
@@ -247,19 +295,19 @@ namespace ThumbnailCacheBuilder {
 '@
 }
 
-function Get-RegisteredHandlerClsid {
+function Get-HandlerRegistryPaths {
     param(
         [string]$File,
         [string]$AssociationIid
     )
 
     $ext = [IO.Path]::GetExtension($File)
-    if ([string]::IsNullOrWhiteSpace($ext)) { return $null }
+    if ([string]::IsNullOrWhiteSpace($ext)) { return @() }
 
-    $root = [Microsoft.Win32.Registry]::ClassesRoot
     $paths = New-Object 'System.Collections.Generic.List[string]'
     $paths.Add($ext + '\shellex\' + $AssociationIid)
 
+    $root = [Microsoft.Win32.Registry]::ClassesRoot
     $extKey = $null
     try {
         $extKey = $root.OpenSubKey($ext)
@@ -278,13 +326,41 @@ function Get-RegisteredHandlerClsid {
     }
 
     $paths.Add('SystemFileAssociations\' + $ext + '\shellex\' + $AssociationIid)
+    return $paths.ToArray()
+}
 
-    foreach ($path in $paths) {
+function Get-RegisteredHandlerClsid {
+    param(
+        [string]$File,
+        [string]$AssociationIid
+    )
+
+    $root = [Microsoft.Win32.Registry]::ClassesRoot
+    foreach ($path in (Get-HandlerRegistryPaths -File $File -AssociationIid $AssociationIid)) {
         $key = $null
         try {
             $key = $root.OpenSubKey($path)
             if ($null -eq $key) { continue }
             $value = [string]$key.GetValue($null)
+            if (-not [string]::IsNullOrWhiteSpace($value)) { return $value }
+        } finally {
+            if ($null -ne $key) { $key.Dispose() }
+        }
+    }
+
+    return $null
+}
+
+function Get-PreviousThumbnailHandlerClsid {
+    param([string]$File)
+
+    $root = [Microsoft.Win32.Registry]::ClassesRoot
+    foreach ($path in (Get-HandlerRegistryPaths -File $File -AssociationIid $thumbnailProviderAssociationIid)) {
+        $key = $null
+        try {
+            $key = $root.OpenSubKey($path)
+            if ($null -eq $key) { continue }
+            $value = [string]$key.GetValue('PrevThumbnailHandler')
             if (-not [string]::IsNullOrWhiteSpace($value)) { return $value }
         } finally {
             if ($null -ne $key) { $key.Dispose() }
@@ -334,6 +410,23 @@ function Invoke-ThumbnailRequest {
         $hr = [ThumbnailCacheBuilder.WorkerNative]::RequestDirectThumbnailProvider($File, $Size, $thumbnailClsid)
         if ($hr -eq 0) {
             return @{ status='Requested'; method='DirectRegisteredThumbnailProvider'; hr=$hr; handler=$thumbnailClsid }
+        }
+    }
+
+    $previousClsid = Get-PreviousThumbnailHandlerClsid -File $File
+    if (-not [string]::IsNullOrWhiteSpace($previousClsid) -and $previousClsid -ne $thumbnailClsid) {
+        $lastHandler = $previousClsid
+        $hr = [ThumbnailCacheBuilder.WorkerNative]::RequestStreamThumbnailProvider($File, $Size, $previousClsid)
+        if ($hr -eq 0) {
+            return @{ status='Requested'; method='PreviousThumbnailHandler'; hr=$hr; handler=$previousClsid }
+        }
+    }
+
+    if ($windowsPhotoThumbnailProviderClsid -ne $thumbnailClsid -and $windowsPhotoThumbnailProviderClsid -ne $previousClsid) {
+        $lastHandler = $windowsPhotoThumbnailProviderClsid
+        $hr = [ThumbnailCacheBuilder.WorkerNative]::RequestStreamThumbnailProvider($File, $Size, $windowsPhotoThumbnailProviderClsid)
+        if ($hr -eq 0) {
+            return @{ status='Requested'; method='WindowsPhotoThumbnailProvider'; hr=$hr; handler=$windowsPhotoThumbnailProviderClsid }
         }
     }
 
