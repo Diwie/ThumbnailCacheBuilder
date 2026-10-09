@@ -28,6 +28,7 @@ param(
     [switch] $ForceRefresh,
     [switch] $IncludeSystemFolders,
     [switch] $ShowDetectedExtensions,
+    [switch] $SkipExtensionDiscovery,
     [int] $ProgressEvery = 250,
     [ValidateRange(0,60000)] [int] $DelayMs = 75,
     [ValidateRange(0,1000000)] [int] $BatchSize = 100,
@@ -62,49 +63,97 @@ $documentExtensionText = 'pdf;doc;docx;xls;xlsx;ppt;pptx'
 $thumbnailIID = '{E357FCCD-A995-4576-B01F-234630154E96}'
 $extractIID   = '{BB2E617C-0920-11D1-9A0B-00C04FC2D6C1}'
 
-function Test-RegisteredShellHandler {
-    param([string]$RegistryPath)
+# Fast registry access: using Microsoft.Win32.RegistryKey directly avoids the
+# very large overhead of Get-ChildItem/Test-Path against the PowerShell
+# Registry provider for thousands of HKCR keys.
+function Test-FastRegisteredShellHandler {
+    param(
+        [Microsoft.Win32.RegistryKey] $Root,
+        [string] $Path,
+        [hashtable] $ClsidCache
+    )
+
+    $handlerKey = $null
     try {
-        if (-not (Test-Path -LiteralPath $RegistryPath)) { return $false }
-        $clsid = (Get-Item -LiteralPath $RegistryPath -ErrorAction Stop).GetValue('')
-        if ([string]::IsNullOrWhiteSpace([string]$clsid)) { return $false }
-        return (Test-Path -LiteralPath ("Registry::HKEY_CLASSES_ROOT\CLSID\$clsid"))
+        $handlerKey = $Root.OpenSubKey($Path)
+        if ($null -eq $handlerKey) { return $false }
+
+        $clsid = [string]$handlerKey.GetValue($null)
+        if ([string]::IsNullOrWhiteSpace($clsid)) { return $false }
+
+        if ($ClsidCache.ContainsKey($clsid)) {
+            return [bool]$ClsidCache[$clsid]
+        }
+
+        $clsidKey = $null
+        try {
+            $clsidKey = $Root.OpenSubKey('CLSID\' + $clsid)
+            $registered = ($null -ne $clsidKey)
+            $ClsidCache[$clsid] = $registered
+            return $registered
+        } finally {
+            if ($null -ne $clsidKey) { $clsidKey.Dispose() }
+        }
     } catch {
         return $false
+    } finally {
+        if ($null -ne $handlerKey) { $handlerKey.Dispose() }
     }
 }
 
 function Get-RegisteredThumbnailExtensions {
+    $watch = [Diagnostics.Stopwatch]::StartNew()
     $found = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $root = [Microsoft.Win32.Registry]::ClassesRoot
+    $clsidCache = @{}
+    $progIdCache = @{}
 
-    foreach ($key in Get-ChildItem 'Registry::HKEY_CLASSES_ROOT' -ErrorAction SilentlyContinue) {
-        $ext = $key.PSChildName
+    # GetSubKeyNames() is dramatically faster here than enumerating HKCR via
+    # the PowerShell Registry provider.
+    foreach ($ext in $root.GetSubKeyNames()) {
         if ([string]::IsNullOrWhiteSpace($ext) -or -not $ext.StartsWith('.')) { continue }
-        if ($ext.Contains('\') -or $ext.Length -lt 2) { continue }
+        if ($ext.Length -lt 2) { continue }
 
         $hasHandler = $false
         foreach ($iid in @($thumbnailIID, $extractIID)) {
-            if (Test-RegisteredShellHandler "Registry::HKEY_CLASSES_ROOT\$ext\shellex\$iid") {
+            if (Test-FastRegisteredShellHandler $root ($ext + '\shellex\' + $iid) $clsidCache) {
                 $hasHandler = $true
                 break
             }
         }
 
+        $progId = ''
         if (-not $hasHandler) {
-            try { $progId = [string]$key.GetValue('') } catch { $progId = '' }
+            $extKey = $null
+            try {
+                $extKey = $root.OpenSubKey($ext)
+                if ($null -ne $extKey) { $progId = [string]$extKey.GetValue($null) }
+            } catch {
+                $progId = ''
+            } finally {
+                if ($null -ne $extKey) { $extKey.Dispose() }
+            }
+
             if (-not [string]::IsNullOrWhiteSpace($progId)) {
-                foreach ($iid in @($thumbnailIID, $extractIID)) {
-                    if (Test-RegisteredShellHandler "Registry::HKEY_CLASSES_ROOT\$progId\shellex\$iid") {
-                        $hasHandler = $true
-                        break
+                if ($progIdCache.ContainsKey($progId)) {
+                    $hasHandler = [bool]$progIdCache[$progId]
+                } else {
+                    $progIdHasHandler = $false
+                    foreach ($iid in @($thumbnailIID, $extractIID)) {
+                        if (Test-FastRegisteredShellHandler $root ($progId + '\shellex\' + $iid) $clsidCache) {
+                            $progIdHasHandler = $true
+                            break
+                        }
                     }
+                    $progIdCache[$progId] = $progIdHasHandler
+                    $hasHandler = $progIdHasHandler
                 }
             }
         }
 
         if (-not $hasHandler) {
             foreach ($iid in @($thumbnailIID, $extractIID)) {
-                if (Test-RegisteredShellHandler "Registry::HKEY_CLASSES_ROOT\SystemFileAssociations\$ext\shellex\$iid") {
+                if (Test-FastRegisteredShellHandler $root ('SystemFileAssociations\' + $ext + '\shellex\' + $iid) $clsidCache) {
                     $hasHandler = $true
                     break
                 }
@@ -114,12 +163,14 @@ function Get-RegisteredThumbnailExtensions {
         if ($hasHandler) { [void]$found.Add($ext.ToLowerInvariant()) }
     }
 
+    $watch.Stop()
+    Write-Host ('Thumbnail handler discovery: {0:n2} s' -f $watch.Elapsed.TotalSeconds) -ForegroundColor DarkGray
     return @($found | Sort-Object)
 }
 
 $staticExtensions = @($extensionText.Trim().Split(';') | ForEach-Object { '.' + $_.Trim().ToLowerInvariant() })
 $documentExtensions = @($documentExtensionText.Split(';') | ForEach-Object { '.' + $_.Trim().ToLowerInvariant() })
-$detectedExtensions = @(Get-RegisteredThumbnailExtensions)
+$detectedExtensions = if ($SkipExtensionDiscovery) { @() } else { @(Get-RegisteredThumbnailExtensions) }
 
 $allowed = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
 foreach ($ext in @($staticExtensions + $documentExtensions + $detectedExtensions)) {
@@ -136,6 +187,7 @@ Write-Host ('  PDF/Office candidates     : {0}' -f $documentExtensions.Count)
 Write-Host ('  Registered handler types  : {0}' -f $detectedExtensions.Count)
 Write-Host ('  Newly discovered types    : {0}' -f $detectedAdditional.Count)
 Write-Host ('  Total unique scan types   : {0}' -f $allowed.Count)
+if ($SkipExtensionDiscovery) { Write-Host '  Dynamic discovery         : skipped' -ForegroundColor DarkYellow }
 if ($ShowDetectedExtensions) {
     Write-Host 'Registered thumbnail-capable extensions:' -ForegroundColor Cyan
     if ($detectedExtensions.Count -gt 0) { Write-Host ('  ' + ($detectedExtensions -join ';')) }
@@ -230,8 +282,6 @@ namespace ThumbnailCacheBuilder {
       return thumbnailCache;
     }
 
-    // Existing path: convenient Shell image factory. THUMBNAILONLY=0x8,
-    // INCACHEONLY=0x10. Icon fallback is intentionally not accepted.
     public static int RequestImageFactory(string path, int size, bool cacheOnly) {
       IShellItemImageFactory factory = null;
       IntPtr bitmap = IntPtr.Zero;
@@ -249,10 +299,6 @@ namespace ThumbnailCacheBuilder {
       }
     }
 
-    // Fallback: use the shared Windows thumbnail cache directly. WTS_EXTRACT
-    // invokes the registered Shell thumbnail handler when no cached thumbnail
-    // exists and stores the result in the shared cache. Optional output
-    // pointers are NULL because this tool only needs to warm the cache.
     public static int RequestThumbnailCache(string path, int size, bool cacheOnly) {
       IShellItem item = null;
       try {
