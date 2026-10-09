@@ -53,9 +53,10 @@ if (-not (Test-Path -LiteralPath $workerScript)) {
 }
 
 $extensionText = @'
-264;265;3g2;3gp;3gp2;3gpp;ai;aiff;amv;ape;asf;avi;av1;avif;bik;bmp;cb7;cbr;cbz;dds;divx;dpg;dv;dvr-ms;eps;epub;evo;exr;f4v;flac;flv;gif;h264;h265;hdmov;hdr;heic;heif;hevc;hif;indd;jpg;k3g;m1v;m2p;m2t;m2ts;m2v;m4a;m4b;m4p;m4v;mk3d;mka;mkv;mod;mov;mp2;mp2v;mp3;mp4;mp4v;mpc;mpe;mpeg;mpg;mpv2;mpv4;mqv;mts;mxf;nsv;odp;ods;odt;ofr;ofs;ogg;ogm;ogv;opus;png;psd;psxprj;px;qt;ram;rm;rmm;rmvb;skm;spx;svg;swf;tak;tga;tif;tiff;tp;tpr;trp;ts;tta;vob;wav;webm;webp;wm;wmv;wtv;wv;xvid
+264;265;3g2;3gp;3gp2;3gpp;ai;aiff;amv;ape;asf;avi;av1;avif;bik;bmp;cb7;cbr;cbz;dds;divx;dpg;dv;dvr-ms;eps;epub;evo;exr;f4v;flac;flv;gif;h264;h265;hdmov;hdr;heic;heif;hevc;hif;jpg;k3g;m1v;m2p;m2t;m2ts;m2v;m4a;m4b;m4p;m4v;mk3d;mka;mkv;mod;mov;mp2;mp2v;mp3;mp4;mp4v;mpc;mpe;mpeg;mpg;mpv2;mpv4;mqv;mts;mxf;nsv;odp;ods;odt;ofr;ofs;ogg;ogm;ogv;opus;png;psd;psxprj;px;qt;ram;rm;rmm;rmvb;skm;spx;svg;swf;tak;tga;tif;tiff;tp;tpr;trp;ts;tta;vob;wav;webm;webp;wm;wmv;wtv;wv;xvid
 '@
 $documentExtensionText = 'pdf;doc;docx;xls;xlsx;ppt;pptx'
+$problemExtensionText = 'indd'
 $thumbnailIID = '{E357FCCD-A995-4576-B01F-234630154E96}'
 $extractIID   = '{BB2E617C-0920-11D1-9A0B-00C04FC2D6C1}'
 
@@ -127,15 +128,23 @@ function Get-RegisteredThumbnailExtensions {
 
 $staticExtensions = @($extensionText.Trim().Split(';') | ForEach-Object { '.' + $_.Trim().ToLowerInvariant() })
 $documentExtensions = @($documentExtensionText.Split(';') | ForEach-Object { '.' + $_.Trim().ToLowerInvariant() })
+$problemExtensions = @($problemExtensionText.Split(';') | ForEach-Object { '.' + $_.Trim().ToLowerInvariant() })
 $detectedExtensions = if ($SkipExtensionDiscovery) { @() } else { @(Get-RegisteredThumbnailExtensions) }
 
 $allowed = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
 foreach ($ext in @($staticExtensions + $documentExtensions + $detectedExtensions)) {
     if (-not [string]::IsNullOrWhiteSpace($ext)) { [void]$allowed.Add($ext) }
 }
+$problemSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+foreach ($ext in $problemExtensions) {
+    if (-not [string]::IsNullOrWhiteSpace($ext)) {
+        [void]$problemSet.Add($ext)
+        [void]$allowed.Remove($ext)
+    }
+}
 $staticSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
 foreach ($ext in @($staticExtensions + $documentExtensions)) { [void]$staticSet.Add($ext) }
-$detectedAdditional = @($detectedExtensions | Where-Object { -not $staticSet.Contains($_) })
+$detectedAdditional = @($detectedExtensions | Where-Object { -not $staticSet.Contains($_) -and -not $problemSet.Contains($_) })
 
 Write-Host ('ThumbnailCacheBuilder {0}' -f $ScriptVersion) -ForegroundColor Cyan
 Write-Host 'Extension sources:' -ForegroundColor Cyan
@@ -143,6 +152,7 @@ Write-Host ('  Built-in media candidates : {0}' -f $staticExtensions.Count)
 Write-Host ('  PDF/Office candidates     : {0}' -f $documentExtensions.Count)
 Write-Host ('  Registered handler types  : {0}' -f $detectedExtensions.Count)
 Write-Host ('  Newly discovered types    : {0}' -f $detectedAdditional.Count)
+Write-Host ('  Problem types excluded    : {0} ({1})' -f $problemExtensions.Count,($problemExtensions -join ';'))
 Write-Host ('  Total unique scan types   : {0}' -f $allowed.Count)
 if ($SkipExtensionDiscovery) { Write-Host '  Dynamic discovery         : skipped' -ForegroundColor DarkYellow }
 if ($ShowDetectedExtensions) {
