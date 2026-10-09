@@ -11,10 +11,16 @@ All notable changes to this project will be documented in this file.
 - Optional `-ShowDetectedExtensions` and `-SkipExtensionDiscovery` switches.
 - Startup statistics for discovery time, extension sources and detected scan locations.
 - Windows `IThumbnailCache` fallback after `IShellItemImageFactory` fails.
+- Direct Shell handler fallbacks through `BindToHandler`, `IThumbnailProvider` and legacy `IExtractImage`.
+- Separate `ThumbnailWorker.ps1` process for thumbnail extraction.
+- Configurable per-file timeout through `-RequestTimeoutSeconds` (15 seconds by default).
+- Automatic worker termination/restart after a provider or codec timeout so scanning can continue.
+- Explicit `Timeout` status in console output, CSV logging and statistics.
 - Method information in console/CSV output to make thumbnail-path diagnostics easier.
 
 ### Changed
 
+- Thumbnail providers now run outside the main scanner process so a hanging media handler cannot block the complete scan indefinitely.
 - Improved per-file error isolation so a failed thumbnail request does not abort the remainder of a directory.
 - Fixed PowerShell 5.1 formatting expressions that could trigger `System.Object[]` / `op_Addition` errors.
 - Expanded document candidates with PDF and Microsoft Office formats.
