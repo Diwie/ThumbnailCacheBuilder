@@ -2,6 +2,7 @@
 param()
 
 $ErrorActionPreference = 'Stop'
+$extractImageAssociationIid = '{BB2E617C-0920-11D1-9A0B-00C04FC2D6C1}'
 
 if (-not ('ThumbnailCacheBuilder.WorkerNative' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -44,11 +45,27 @@ namespace ThumbnailCacheBuilder {
     [PreserveSig] int Extract(out IntPtr bitmap);
   }
 
+  [ComImport, Guid("B7D14566-0509-4CCE-A71F-0A554233BD9B"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  public interface IWorkerInitializeWithFile {
+    [PreserveSig] int Initialize([MarshalAs(UnmanagedType.LPWStr)] string filePath, uint mode);
+  }
+
+  [ComImport, Guid("0000010B-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  public interface IWorkerPersistFile {
+    [PreserveSig] int GetClassID(out Guid classId);
+    [PreserveSig] int IsDirty();
+    [PreserveSig] int Load([MarshalAs(UnmanagedType.LPWStr)] string fileName, uint mode);
+    [PreserveSig] int Save([MarshalAs(UnmanagedType.LPWStr)] string fileName, bool remember);
+    [PreserveSig] int SaveCompleted([MarshalAs(UnmanagedType.LPWStr)] string fileName);
+    [PreserveSig] int GetCurFile([MarshalAs(UnmanagedType.LPWStr)] out string fileName);
+  }
+
   public static class WorkerNative {
     const uint WTS_INCACHEONLY = 1;
     const uint IEIFLAG_ASPECT = 4;
     const uint IEIFLAG_SCREEN = 0x20;
     const uint IEIFLAG_QUALITY = 0x200;
+    const uint STGM_READ = 0;
 
     static readonly Guid CLSID_LocalThumbnailCache = new Guid("50EF4544-AC9F-4A8E-B21B-8A26180DB13F");
     static readonly Guid BHID_ThumbnailHandler = new Guid("7B2E650A-8E20-4F4A-B09E-6597AFC72FB0");
@@ -136,20 +153,68 @@ namespace ThumbnailCacheBuilder {
         hr = item.BindToHandler(IntPtr.Zero, ref bhid, ref extractIid, out raw);
         if (hr < 0 || raw == IntPtr.Zero) return hr < 0 ? hr : unchecked((int)0x80004005);
         extractor = (IWorkerExtractImage)Marshal.GetTypedObjectForIUnknown(raw, typeof(IWorkerExtractImage));
+        return ExtractLegacy(extractor, path, size);
+      } catch (COMException ex) { return ex.ErrorCode; }
+        catch { return unchecked((int)0x80004005); }
+      finally {
+        if (extractor != null) Marshal.ReleaseComObject(extractor);
+        if (raw != IntPtr.Zero) Marshal.Release(raw);
+        if (item != null) Marshal.ReleaseComObject(item);
+      }
+    }
+
+    static int InitializeLegacyHandler(object handler, string path) {
+      IWorkerInitializeWithFile initFile = handler as IWorkerInitializeWithFile;
+      if (initFile != null) {
+        int hr = initFile.Initialize(path, STGM_READ);
+        if (hr >= 0) return hr;
+      }
+
+      IWorkerPersistFile persistFile = handler as IWorkerPersistFile;
+      if (persistFile != null) {
+        int hr = persistFile.Load(path, STGM_READ);
+        if (hr >= 0) return hr;
+        return hr;
+      }
+
+      return unchecked((int)0x80004002);
+    }
+
+    static int ExtractLegacy(IWorkerExtractImage extractor, string path, int size) {
+      IntPtr bitmap = IntPtr.Zero;
+      try {
         WorkerNativeSize s = new WorkerNativeSize { Width = size, Height = size };
         uint priority;
         uint flags = IEIFLAG_ASPECT | IEIFLAG_SCREEN | IEIFLAG_QUALITY;
         StringBuilder location = new StringBuilder(32768);
-        hr = extractor.GetLocation(location, (uint)location.Capacity, out priority, ref s, 32, ref flags);
+        int hr = extractor.GetLocation(location, (uint)location.Capacity, out priority, ref s, 32, ref flags);
         if (hr < 0) return hr;
         return extractor.Extract(out bitmap);
+      } finally {
+        if (bitmap != IntPtr.Zero) DeleteObject(bitmap);
+      }
+    }
+
+    public static int RequestDirectExtractImage(string path, int size, string clsidText) {
+      object handler = null;
+      IWorkerExtractImage extractor = null;
+      try {
+        Guid clsid;
+        if (!Guid.TryParse(clsidText, out clsid)) return unchecked((int)0x80070057);
+        Type t = Type.GetTypeFromCLSID(clsid, true);
+        handler = Activator.CreateInstance(t);
+        extractor = handler as IWorkerExtractImage;
+        if (extractor == null) return unchecked((int)0x80004002);
+
+        int initHr = InitializeLegacyHandler(handler, path);
+        if (initHr < 0 && initHr != unchecked((int)0x80004002)) return initHr;
+
+        return ExtractLegacy(extractor, path, size);
       } catch (COMException ex) { return ex.ErrorCode; }
         catch { return unchecked((int)0x80004005); }
       finally {
-        if (bitmap != IntPtr.Zero) DeleteObject(bitmap);
-        if (extractor != null) Marshal.ReleaseComObject(extractor);
-        if (raw != IntPtr.Zero) Marshal.Release(raw);
-        if (item != null) Marshal.ReleaseComObject(item);
+        if (extractor != null && Marshal.IsComObject(extractor)) Marshal.ReleaseComObject(extractor);
+        else if (handler != null && Marshal.IsComObject(handler)) Marshal.ReleaseComObject(handler);
       }
     }
   }
@@ -157,12 +222,54 @@ namespace ThumbnailCacheBuilder {
 '@
 }
 
+function Get-RegisteredExtractImageClsid {
+    param([string]$File)
+
+    $ext = [IO.Path]::GetExtension($File)
+    if ([string]::IsNullOrWhiteSpace($ext)) { return $null }
+
+    $root = [Microsoft.Win32.Registry]::ClassesRoot
+    $paths = New-Object 'System.Collections.Generic.List[string]'
+    $paths.Add($ext + '\shellex\' + $extractImageAssociationIid)
+
+    $extKey = $null
+    try {
+        $extKey = $root.OpenSubKey($ext)
+        if ($null -ne $extKey) {
+            $progId = [string]$extKey.GetValue($null)
+            if (-not [string]::IsNullOrWhiteSpace($progId)) {
+                $paths.Add($progId + '\shellex\' + $extractImageAssociationIid)
+            }
+            $perceivedType = [string]$extKey.GetValue('PerceivedType')
+            if (-not [string]::IsNullOrWhiteSpace($perceivedType)) {
+                $paths.Add('SystemFileAssociations\' + $perceivedType + '\shellex\' + $extractImageAssociationIid)
+            }
+        }
+    } finally {
+        if ($null -ne $extKey) { $extKey.Dispose() }
+    }
+
+    $paths.Add('SystemFileAssociations\' + $ext + '\shellex\' + $extractImageAssociationIid)
+
+    foreach ($path in $paths) {
+        $key = $null
+        try {
+            $key = $root.OpenSubKey($path)
+            if ($null -eq $key) { continue }
+            $value = [string]$key.GetValue($null)
+            if (-not [string]::IsNullOrWhiteSpace($value)) { return $value }
+        } finally {
+            if ($null -ne $key) { $key.Dispose() }
+        }
+    }
+
+    return $null
+}
+
 function Invoke-ThumbnailRequest {
     param([string]$File, [int]$Size, [bool]$ForceRefresh)
 
     $hr = -1
-    $method = 'ImageFactory'
-    $status = 'Failed'
 
     if (-not $ForceRefresh) {
         $hr = [ThumbnailCacheBuilder.WorkerNative]::RequestImageFactory($File, $Size, $true)
@@ -183,7 +290,15 @@ function Invoke-ThumbnailRequest {
     $hr = [ThumbnailCacheBuilder.WorkerNative]::RequestBoundExtractImage($File, $Size)
     if ($hr -eq 0) { return @{ status='Requested'; method='BoundExtractImage'; hr=$hr } }
 
-    return @{ status='Failed'; method='AllMethods'; hr=$hr }
+    $directClsid = Get-RegisteredExtractImageClsid -File $File
+    if (-not [string]::IsNullOrWhiteSpace($directClsid)) {
+        $hr = [ThumbnailCacheBuilder.WorkerNative]::RequestDirectExtractImage($File, $Size, $directClsid)
+        if ($hr -eq 0) {
+            return @{ status='Requested'; method='DirectRegisteredExtractImage'; hr=$hr; handler=$directClsid }
+        }
+    }
+
+    return @{ status='Failed'; method='AllMethods'; hr=$hr; handler=$directClsid }
 }
 
 while (($line = [Console]::In.ReadLine()) -ne $null) {
