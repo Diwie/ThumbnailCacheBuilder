@@ -319,21 +319,21 @@ function Invoke-ThumbnailRequest {
     $hr = [ThumbnailCacheBuilder.WorkerNative]::RequestBoundExtractImage($File, $Size)
     if ($hr -eq 0) { return @{ status='Requested'; method='BoundExtractImage'; hr=$hr } }
 
-    $thumbnailClsid = Get-RegisteredHandlerClsid -File $File -AssociationIid $thumbnailProviderAssociationIid
-    if (-not [string]::IsNullOrWhiteSpace($thumbnailClsid)) {
-        $lastHandler = $thumbnailClsid
-        $hr = [ThumbnailCacheBuilder.WorkerNative]::RequestDirectThumbnailProvider($File, $Size, $thumbnailClsid)
-        if ($hr -eq 0) {
-            return @{ status='Requested'; method='DirectRegisteredThumbnailProvider'; hr=$hr; handler=$thumbnailClsid }
-        }
-    }
-
     $extractClsid = Get-RegisteredHandlerClsid -File $File -AssociationIid $extractImageAssociationIid
     if (-not [string]::IsNullOrWhiteSpace($extractClsid)) {
         $lastHandler = $extractClsid
         $hr = [ThumbnailCacheBuilder.WorkerNative]::RequestDirectExtractImage($File, $Size, $extractClsid)
         if ($hr -eq 0) {
             return @{ status='Requested'; method='DirectRegisteredExtractImage'; hr=$hr; handler=$extractClsid }
+        }
+    }
+
+    $thumbnailClsid = Get-RegisteredHandlerClsid -File $File -AssociationIid $thumbnailProviderAssociationIid
+    if (-not [string]::IsNullOrWhiteSpace($thumbnailClsid)) {
+        $lastHandler = $thumbnailClsid
+        $hr = [ThumbnailCacheBuilder.WorkerNative]::RequestDirectThumbnailProvider($File, $Size, $thumbnailClsid)
+        if ($hr -eq 0) {
+            return @{ status='Requested'; method='DirectRegisteredThumbnailProvider'; hr=$hr; handler=$thumbnailClsid }
         }
     }
 
