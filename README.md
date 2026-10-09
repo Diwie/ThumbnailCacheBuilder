@@ -74,7 +74,7 @@ After each drive the script prints its processed, cached, requested, failed and 
 
 ## License
 
-GPL-3.0-only; see `LICENSE`.
+GPL-3.0-or-later; see `LICENSE`.
 
 ### Default log path
 
