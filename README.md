@@ -30,7 +30,31 @@ The scan list is deliberately built from three sources:
 
 These sources are merged case-insensitively and de-duplicated. A detected handler still does not guarantee that every file of that type can be rendered successfully.
 
-Use `-ShowDetectedExtensions` to display all extensions discovered from the registry and which of them were not already in the built-in/document lists.
+Use `-ShowDetectedExtensions` to display all extensions discovered from the registry and which of them were not already in the built-in/document lists. Use `-SkipExtensionDiscovery` to skip dynamic registry discovery and use only the built-in plus PDF/Office candidates.
+
+### Example startup output
+
+The exact numbers depend on the installed shell extensions and file associations. A real-world startup can look like this:
+
+```text
+Thumbnail handler discovery: 2,03 s
+Extension sources:
+  Built-in media candidates : 112
+  PDF/Office candidates     : 7
+  Registered handler types  : 341
+  Newly discovered types    : 222
+  Total unique scan types   : 341
+Detected scan locations:
+  C:\
+  D:\
+  L:\
+  P:\
+  Q:\
+  S:\
+  W:\
+```
+
+This makes it immediately visible how much of the scan list comes from the built-in candidates versus the current Windows installation, and how quickly the handler discovery completed.
 
 ## Examples
 
@@ -43,6 +67,9 @@ Use `-ShowDetectedExtensions` to display all extensions discovered from the regi
 
 # Show dynamically detected shell-thumbnail extensions
 .\Build-ThumbnailCache.ps1 -Paths 'C:\Temp' -ShowDetectedExtensions
+
+# Skip dynamic registry discovery
+.\Build-ThumbnailCache.ps1 -SkipExtensionDiscovery
 
 # Scan selected drives and write a streaming CSV log
 .\Build-ThumbnailCache.ps1 -Paths 'D:\','E:\' -LogFile 'C:\Temp\ThumbnailScan.csv'
@@ -57,6 +84,12 @@ Use `-ShowDetectedExtensions` to display all extensions discovered from the regi
 .\Build-ThumbnailCache.ps1 -IncludeSystemFolders
 ```
 
+## Thumbnail request strategy
+
+The normal request path uses `IShellItemImageFactory`. If that route fails, ThumbnailCacheBuilder falls back to the shared Windows `IThumbnailCache` API. This gives Windows another opportunity to invoke the registered thumbnail handler and populate the Explorer cache, which is particularly useful for document formats such as PDF and Office files.
+
+The console and CSV output show which method succeeded (`ImageFactory` or `ThumbnailCache`).
+
 ## Statistics
 
 After each drive the script prints its processed, cached, requested, failed and skipped-directory counts. At the end it displays a per-drive summary table and overall totals, plus elapsed time. These counters use constant memory per drive rather than retaining individual file results. The CSV contains individual file statuses.
@@ -67,6 +100,7 @@ At startup it also shows extension-source statistics: built-in count, PDF/Office
 
 - Processes drives strictly one at a time, waiting 30 seconds between drives by default.
 - Throttles requests: 75 ms per file plus 3 seconds per 100 matching files; tune with `-DelayMs`, `-BatchSize`, `-BatchPauseMs`, `-DrivePauseMs`. This reduces load but cannot enforce a memory limit on third-party providers.
+- Uses direct .NET registry access for dynamic extension discovery instead of recursively walking HKCR through the slower PowerShell registry provider.
 - Iterates files lazily and uses an explicit directory stack instead of recursively loading a full file tree.
 - Writes CSV **incrementally** by default and displays the same status in the console. `-LogFile` overrides the default log location. No per-file results are retained in RAM.
 - Releases native HBITMAP and COM references after every request.
@@ -77,8 +111,8 @@ At startup it also shows extension-source statistics: built-in count, PDF/Office
 
 ## Limitations
 
-- The current thumbnail request path uses `IShellItemImageFactory`. Some document handlers may display correctly in Explorer yet not respond through this route. Direct `IThumbnailProvider` / `IExtractImage` fallback support is a planned enhancement.
-- A successful COM call indicates Windows returned a thumbnail bitmap; it does not prove Explorer will keep it permanently in cache.
+- The fallback still relies on the Windows Shell and the thumbnail handlers installed on the machine. A registered handler can be missing, broken or unable to render a particular file.
+- A successful COM call indicates Windows returned or cached a thumbnail; it does not prove Explorer will keep it permanently in cache.
 - Cache-only requests are best-effort and may miss valid thumbnails at different requested sizes.
 - Windows can evict the cache at any time.
 - The extension list is a *candidate filter*, not a guarantee that every format has a working thumbnail provider.
@@ -88,7 +122,7 @@ At startup it also shows extension-source statistics: built-in count, PDF/Office
 
 ## Roadmap
 
-- Direct document-handler fallback using registered `IThumbnailProvider` / `IExtractImage` implementations
+- Further document-handler compatibility where `IShellItemImageFactory` and `IThumbnailCache` are both insufficient
 - Optional GUI for Windows
 - Signed and reproducible release builds
 
