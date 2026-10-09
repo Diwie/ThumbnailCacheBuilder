@@ -2,7 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.1.0] - 2026-10-09
+## [1.1] - 2026-10-09
+
+### Added
+
+- Fast dynamic discovery of registered thumbnail-capable file extensions using direct .NET registry access.
+- Extension selection now combines the built-in media list, explicit PDF/Office candidates and dynamically detected shell-handler extensions.
+- Optional `-ShowDetectedExtensions` and `-SkipExtensionDiscovery` switches.
+- Startup statistics for discovery time, extension sources and detected scan locations.
+- Windows `IThumbnailCache` fallback after `IShellItemImageFactory` fails.
+- Method information in console/CSV output to make thumbnail-path diagnostics easier.
+
+### Changed
+
+- Improved per-file error isolation so a failed thumbnail request does not abort the remainder of a directory.
+- Fixed PowerShell 5.1 formatting expressions that could trigger `System.Object[]` / `op_Addition` errors.
+- Expanded document candidates with PDF and Microsoft Office formats.
+
+### Known issues
+
+- Some document shell handlers work in Explorer but still reject programmatic extraction. On the current test system `.doc` can return `0x8004B200` (`WTS_E_FAILEDEXTRACTION`) and PDF can return `0x80040154` (`REGDB_E_CLASSNOTREG`) even though Explorer thumbnails are available.
+- Thumbnail support ultimately depends on the installed shell provider and the activation context Windows allows for that provider.
+
+## [1.0] - 2026-10-09
 
 ### Added
 
