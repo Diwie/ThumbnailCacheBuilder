@@ -4,13 +4,17 @@
   Warms the Windows Explorer thumbnail cache using registered shell providers.
 .DESCRIPTION
   Scans fixed local disks by default, requests missing thumbnails and streams
-  CSV results to disk while displaying each result in the console. Does not modify source files or shell associations.
+  CSV results to disk while displaying each result in the console. The scan
+  extension set combines a built-in media list, PDF/Office formats and file
+  extensions discovered from registered Windows thumbnail handlers.
 .EXAMPLE
   .\Build-ThumbnailCache.ps1
 .EXAMPLE
   .\Build-ThumbnailCache.ps1 -Paths 'D:\Fotos','E:\Videos' -Size 256 -LogFile 'C:\Temp\thumbnails.csv'
 .EXAMPLE
   .\Build-ThumbnailCache.ps1 -Paths 'C:\Temp' -ForceRefresh -Verbose
+.EXAMPLE
+  .\Build-ThumbnailCache.ps1 -Paths 'C:\Temp' -ShowDetectedExtensions
 #>
 [CmdletBinding()]
 param(
@@ -19,6 +23,7 @@ param(
     [string] $LogFile = '',
     [switch] $ForceRefresh,
     [switch] $IncludeSystemFolders,
+    [switch] $ShowDetectedExtensions,
     [int] $ProgressEvery = 250,
     [ValidateRange(0,60000)] [int] $DelayMs = 75,
     [ValidateRange(0,1000000)] [int] $BatchSize = 100,
@@ -29,8 +34,6 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-# Resolve the default log path after parameter binding; $PSScriptRoot can be
-# empty during evaluation of parameter default expressions.
 if ([string]::IsNullOrWhiteSpace($LogFile)) {
     $scriptDirectory = if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
         $PSScriptRoot
@@ -42,12 +45,101 @@ if ([string]::IsNullOrWhiteSpace($LogFile)) {
     $LogFile = Join-Path $scriptDirectory 'ThumbnailScan.csv'
 }
 
-# Includes the original extension list plus Apple/web/HEVC additions.
+# Stable built-in candidate list. This intentionally remains independent of
+# third-party shell registration (for example Icaros).
 $extensionText = @'
 264;265;3g2;3gp;3gp2;3gpp;ai;aiff;amv;ape;asf;avi;av1;avif;bik;bmp;cb7;cbr;cbz;dds;divx;dpg;dv;dvr-ms;eps;epub;evo;exr;f4v;flac;flv;gif;h264;h265;hdmov;hdr;heic;heif;hevc;hif;indd;jpg;k3g;m1v;m2p;m2t;m2ts;m2v;m4a;m4b;m4p;m4v;mk3d;mka;mkv;mod;mov;mp2;mp2v;mp3;mp4;mp4v;mpc;mpe;mpeg;mpg;mpv2;mpv4;mqv;mts;mxf;nsv;odp;ods;odt;ofr;ofs;ogg;ogm;ogv;opus;png;psd;psxprj;px;qt;ram;rm;rmm;rmvb;skm;spx;svg;swf;tak;tga;tif;tiff;tp;tpr;trp;ts;tta;vob;wav;webm;webp;wm;wmv;wtv;wv;xvid
 '@
+
+# Explicit document candidates. They are scanned even when the respective
+# handler is not discoverable through the registry.
+$documentExtensionText = 'pdf;doc;docx;xls;xlsx;ppt;pptx'
+
+$thumbnailIID = '{E357FCCD-A995-4576-B01F-234630154E96}'
+$extractIID   = '{BB2E617C-0920-11D1-9A0B-00C04FC2D6C1}'
+
+function Test-RegisteredShellHandler {
+    param([string]$RegistryPath)
+    try {
+        if (-not (Test-Path -LiteralPath $RegistryPath)) { return $false }
+        $clsid = (Get-Item -LiteralPath $RegistryPath -ErrorAction Stop).GetValue('')
+        if ([string]::IsNullOrWhiteSpace([string]$clsid)) { return $false }
+        return (Test-Path -LiteralPath ("Registry::HKEY_CLASSES_ROOT\CLSID\$clsid"))
+    } catch {
+        return $false
+    }
+}
+
+function Get-RegisteredThumbnailExtensions {
+    $found = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($key in Get-ChildItem 'Registry::HKEY_CLASSES_ROOT' -ErrorAction SilentlyContinue) {
+        $ext = $key.PSChildName
+        if ([string]::IsNullOrWhiteSpace($ext) -or -not $ext.StartsWith('.')) { continue }
+        if ($ext.Contains('\') -or $ext.Length -lt 2) { continue }
+
+        $hasHandler = $false
+        foreach ($iid in @($thumbnailIID, $extractIID)) {
+            if (Test-RegisteredShellHandler "Registry::HKEY_CLASSES_ROOT\$ext\shellex\$iid") {
+                $hasHandler = $true
+                break
+            }
+        }
+
+        if (-not $hasHandler) {
+            try { $progId = [string]$key.GetValue('') } catch { $progId = '' }
+            if (-not [string]::IsNullOrWhiteSpace($progId)) {
+                foreach ($iid in @($thumbnailIID, $extractIID)) {
+                    if (Test-RegisteredShellHandler "Registry::HKEY_CLASSES_ROOT\$progId\shellex\$iid") {
+                        $hasHandler = $true
+                        break
+                    }
+                }
+            }
+        }
+
+        if (-not $hasHandler) {
+            foreach ($iid in @($thumbnailIID, $extractIID)) {
+                if (Test-RegisteredShellHandler "Registry::HKEY_CLASSES_ROOT\SystemFileAssociations\$ext\shellex\$iid") {
+                    $hasHandler = $true
+                    break
+                }
+            }
+        }
+
+        if ($hasHandler) { [void]$found.Add($ext.ToLowerInvariant()) }
+    }
+
+    return @($found | Sort-Object)
+}
+
+$staticExtensions = @($extensionText.Trim().Split(';') | ForEach-Object { '.' + $_.Trim().ToLowerInvariant() })
+$documentExtensions = @($documentExtensionText.Split(';') | ForEach-Object { '.' + $_.Trim().ToLowerInvariant() })
+$detectedExtensions = @(Get-RegisteredThumbnailExtensions)
+
 $allowed = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-foreach ($ext in $extensionText.Trim().Split(';')) { [void]$allowed.Add('.' + $ext) }
+foreach ($ext in @($staticExtensions + $documentExtensions + $detectedExtensions)) {
+    if (-not [string]::IsNullOrWhiteSpace($ext)) { [void]$allowed.Add($ext) }
+}
+
+$staticSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+foreach ($ext in @($staticExtensions + $documentExtensions)) { [void]$staticSet.Add($ext) }
+$detectedAdditional = @($detectedExtensions | Where-Object { -not $staticSet.Contains($_) })
+
+Write-Host 'Extension sources:' -ForegroundColor Cyan
+Write-Host ('  Built-in media candidates : {0}' -f $staticExtensions.Count)
+Write-Host ('  PDF/Office candidates     : {0}' -f $documentExtensions.Count)
+Write-Host ('  Registered handler types  : {0}' -f $detectedExtensions.Count)
+Write-Host ('  Newly discovered types    : {0}' -f $detectedAdditional.Count)
+Write-Host ('  Total unique scan types   : {0}' -f $allowed.Count)
+if ($ShowDetectedExtensions) {
+    Write-Host 'Registered thumbnail-capable extensions:' -ForegroundColor Cyan
+    if ($detectedExtensions.Count -gt 0) { Write-Host ('  ' + ($detectedExtensions -join ';')) }
+    else { Write-Host '  (none detected)' }
+    Write-Host 'Additional extensions not in the built-in/document lists:' -ForegroundColor Cyan
+    if ($detectedAdditional.Count -gt 0) { Write-Host ('  ' + ($detectedAdditional -join ';')) }
+    else { Write-Host '  (none)' }
+}
 
 if (-not $PSBoundParameters.ContainsKey('Paths')) {
     $Paths = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object { $_.DeviceID + '\' })
@@ -58,7 +150,6 @@ foreach ($scanPath in $Paths) { Write-Host ('  ' + $scanPath) }
 Write-Host ('CSV log: ' + [IO.Path]::GetFullPath($LogFile))
 Write-Host ('Throttle: {0} ms/file, {1} ms per {2} files, {3} ms between drives' -f $DelayMs, $BatchPauseMs, $BatchSize, $DrivePauseMs)
 
-# In a fresh Windows PowerShell process this type is compiled once.
 if (-not ('ThumbnailCacheBuilder.Native' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
@@ -74,7 +165,6 @@ namespace ThumbnailCacheBuilder {
     static extern void SHCreateItemFromParsingName(string path, IntPtr ctx, ref Guid iid,
       [MarshalAs(UnmanagedType.Interface)] out IShellItemImageFactory factory);
     [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr handle);
-    // THUMBNAILONLY=0x8, INCACHEONLY=0x10. Do not accept icon fallback.
     public static int Request(string path, int size, bool cacheOnly) {
       IShellItemImageFactory factory = null;
       IntPtr bitmap = IntPtr.Zero;
@@ -95,7 +185,6 @@ namespace ThumbnailCacheBuilder {
 '@
 }
 
-# Stream CSV directly to disk, without keeping an in-memory results array.
 $writer = $null
 if ($LogFile) {
     $fullLog = [IO.Path]::GetFullPath($LogFile)
@@ -105,8 +194,8 @@ if ($LogFile) {
     $writer.WriteLine('"File","Status","HRESULT"')
 }
 function Write-Result([string]$file, [string]$status, [int]$hr) {
-    $hrText = '0x{0:X8}' -f ([uint32]([int64]$hr -band 0xFFFFFFFFL))
-    Write-Host ('[{0}] {1} ({2})' -f $status, $file, $hrText)
+    $hrText = '0x' + ([uint32]([int64]$hr -band 0xFFFFFFFFL)).ToString('X8')
+    Write-Host ('[{0}] {1} ({2})' -f @($status, $file, $hrText))
     if ($null -eq $writer) { return }
     $escapedFile = $file.Replace('"','""')
     $csvLine = '"{0}","{1}","{2}"' -f @($escapedFile, $status, $hrText)
@@ -119,6 +208,7 @@ if (-not $IncludeSystemFolders) {
         if ($p) { $excluded += ([IO.Path]::GetFullPath($p).TrimEnd('\') + '\') }
     }
 }
+
 $processed = 0; $cached = 0; $requested = 0; $failed = 0; $skippedDirs = 0
 $driveStatistics = New-Object 'System.Collections.Generic.List[object]'
 $watch = [Diagnostics.Stopwatch]::StartNew()
@@ -129,12 +219,13 @@ try {
             Write-Host ('Waiting {0} seconds before next drive...' -f ($DrivePauseMs / 1000)) -ForegroundColor Yellow
             Start-Sleep -Milliseconds $DrivePauseMs
         }
-        Write-Host ('Starting location {0}/{1}: {2}' -f ($driveIndex + 1), $Paths.Count, $root) -ForegroundColor Cyan
+        Write-Host ('Starting location {0}/{1}: {2}' -f @($driveIndex + 1, $Paths.Count, $root)) -ForegroundColor Cyan
         $driveProcessed = 0; $driveCached = 0; $driveRequested = 0; $driveFailed = 0; $driveSkipped = 0
         $driveWatch = [Diagnostics.Stopwatch]::StartNew()
         if (-not [IO.Directory]::Exists($root)) { Write-Warning "Path not found: $root"; $driveWatch.Stop(); continue }
         $stack = New-Object 'System.Collections.Generic.Stack[string]'
         $stack.Push([IO.Path]::GetFullPath($root))
+
         while ($stack.Count -gt 0) {
             $directory = $stack.Pop()
             $directoryPrefix = $directory.TrimEnd('\') + '\'
@@ -143,45 +234,57 @@ try {
                 if ($directoryPrefix.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { $skip = $true; break }
             }
             if ($skip) { $skippedDirs++; $driveSkipped++; continue }
-            try {
-                # Directory enumeration is lazy, avoiding Get-ChildItem -Recurse allocations.
-                foreach ($file in [IO.Directory]::EnumerateFiles($directory)) {
-                    if (-not $allowed.Contains([IO.Path]::GetExtension($file))) { continue }
-                    $processed++
-                    $driveProcessed++
+
+            try { $files = [IO.Directory]::EnumerateFiles($directory) }
+            catch { $skippedDirs++; $driveSkipped++; Write-Verbose "Cannot enumerate files in $directory : $_"; $files = @() }
+
+            foreach ($file in $files) {
+                if (-not $allowed.Contains([IO.Path]::GetExtension($file))) { continue }
+                $processed++; $driveProcessed++
+                try {
                     $hr = -1
-                    if (-not $ForceRefresh) {
-                        $hr = [ThumbnailCacheBuilder.Native]::Request($file, $Size, $true)
-                    }
+                    if (-not $ForceRefresh) { $hr = [ThumbnailCacheBuilder.Native]::Request($file, $Size, $true) }
                     if ($hr -eq 0) {
                         $cached++; $driveCached++; Write-Result $file 'Cached' $hr
                     } else {
                         $hr = [ThumbnailCacheBuilder.Native]::Request($file, $Size, $false)
-                        if ($hr -eq 0) { $requested++; $driveRequested++; Write-Result $file 'Requested' $hr }
-                        else { $failed++; $driveFailed++; Write-Result $file 'Failed' $hr; Write-Verbose "Failed 0x$('{0:X8}' -f ([uint32]([int64]$hr -band 0xFFFFFFFFL))): $file" }
+                        if ($hr -eq 0) {
+                            $requested++; $driveRequested++; Write-Result $file 'Requested' $hr
+                        } else {
+                            $failed++; $driveFailed++; Write-Result $file 'Failed' $hr
+                            Write-Verbose ("Failed 0x{0}: {1}" -f @(([uint32]([int64]$hr -band 0xFFFFFFFFL)).ToString('X8'), $file))
+                        }
                     }
-                    if ($DelayMs -gt 0) { Start-Sleep -Milliseconds $DelayMs }
-                    if ($BatchSize -gt 0 -and $driveProcessed % $BatchSize -eq 0 -and $BatchPauseMs -gt 0) {
-                        if ($writer) { $writer.Flush() }
-                        Write-Host ('Cooldown: {0} seconds after {1} files on {2}' -f ($BatchPauseMs / 1000), $driveProcessed, $root) -ForegroundColor DarkYellow
-                        Start-Sleep -Milliseconds $BatchPauseMs
-                    }
-                    if ($ProgressEvery -gt 0 -and $processed % $ProgressEvery -eq 0) {
-                        Write-Progress -Activity 'Building Windows thumbnail cache' -Status "$processed scanned | $cached cached | $requested requested | $failed failed"
-                        if ($writer) { $writer.Flush() }
-                    }
+                } catch {
+                    $failed++; $driveFailed++
+                    Write-Warning "File processing error: $file : $_"
                 }
-                foreach ($subdir in [IO.Directory]::EnumerateDirectories($directory)) {
-                    try {
-                        $attributes = [IO.File]::GetAttributes($subdir)
-                        if (-not ($attributes -band [IO.FileAttributes]::ReparsePoint)) { $stack.Push($subdir) }
-                    } catch { $skippedDirs++; $driveSkipped++; Write-Verbose "Skipping $subdir : $_" }
+
+                if ($DelayMs -gt 0) { Start-Sleep -Milliseconds $DelayMs }
+                if ($BatchSize -gt 0 -and $driveProcessed % $BatchSize -eq 0 -and $BatchPauseMs -gt 0) {
+                    if ($writer) { $writer.Flush() }
+                    Write-Host ('Cooldown: {0} seconds after {1} files on {2}' -f @($BatchPauseMs / 1000, $driveProcessed, $root)) -ForegroundColor DarkYellow
+                    Start-Sleep -Milliseconds $BatchPauseMs
                 }
-            } catch {
-                $skippedDirs++; $driveSkipped++
-                Write-Verbose "Cannot enumerate $directory : $_"
+                if ($ProgressEvery -gt 0 -and $processed % $ProgressEvery -eq 0) {
+                    Write-Progress -Activity 'Building Windows thumbnail cache' -Status "$processed scanned | $cached cached | $requested requested | $failed failed"
+                    if ($writer) { $writer.Flush() }
+                }
+            }
+
+            try { $subdirs = [IO.Directory]::EnumerateDirectories($directory) }
+            catch { $skippedDirs++; $driveSkipped++; Write-Verbose "Cannot enumerate subdirectories in $directory : $_"; $subdirs = @() }
+
+            foreach ($subdir in $subdirs) {
+                try {
+                    $attributes = [IO.File]::GetAttributes($subdir)
+                    if (-not ($attributes -band [IO.FileAttributes]::ReparsePoint)) { $stack.Push($subdir) }
+                } catch {
+                    $skippedDirs++; $driveSkipped++; Write-Verbose "Skipping $subdir : $_"
+                }
             }
         }
+
         $driveWatch.Stop()
         $driveStatistics.Add([pscustomobject]@{
             Location = $root; Files = $driveProcessed; Cached = $driveCached
@@ -197,11 +300,10 @@ try {
     $watch.Stop()
     Write-Progress -Activity 'Building Windows thumbnail cache' -Completed
 }
-Write-Host '
-=== Per-drive statistics ===' -ForegroundColor Cyan
+
+Write-Host "`n=== Per-drive statistics ===" -ForegroundColor Cyan
 $driveStatistics | Format-Table -AutoSize | Out-Host
-Write-Host '
-=== Overall statistics ===' -ForegroundColor Cyan
+Write-Host "`n=== Overall statistics ===" -ForegroundColor Cyan
 Write-Host "Scanned: $processed | Cached: $cached | Requested: $requested | Failed: $failed | Skipped directories: $skippedDirs"
 Write-Host ('Duration: {0:n1} minutes' -f $watch.Elapsed.TotalMinutes)
 if ($LogFile) { Write-Host "CSV log: $([IO.Path]::GetFullPath($LogFile))" }
