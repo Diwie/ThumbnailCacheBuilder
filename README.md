@@ -1,43 +1,42 @@
 # ThumbnailCacheBuilder
 
-A lightweight Windows PowerShell 5.1+ tool to warm the **Windows Explorer thumbnail cache** for supported image, video, audio-cover and document formats. No installer, admin rights or third-party dependencies are required.
+A lightweight Windows PowerShell 5.1+ tool to warm the **Windows Explorer thumbnail cache** for supported image, video, audio-cover and document formats. No installer or admin rights are required.
 
-The tool asks Windows' registered thumbnail providers (such as Windows Photo Thumbnail Provider, Office shell handlers, PowerToys PDF thumbnails or Icaros) to produce previews. **It does not install codecs, fix broken providers, change registry associations, modify media files, or guarantee thumbnails for every listed extension.**
+ThumbnailCacheBuilder asks Windows' registered thumbnail providers to produce previews. It does **not** install codecs, repair broken providers, change file associations or modify source files.
 
 ## Quick start
 
-Download `Build-ThumbnailCache.ps1`, then run in Windows PowerShell (in the signed-in user's session):
+Keep `Build-ThumbnailCache.ps1` and `ThumbnailWorker.ps1` in the same directory, then run:
 
 ```powershell
-powershell.exe -NoProfile -File "C:\steve\bat\ThumbnailCacheBuilder\Build-ThumbnailCache.ps1"
+powershell.exe -NoProfile -File ".\Build-ThumbnailCache.ps1"
 ```
 
-If your machine's execution policy blocks local scripts, review the script first and use a one-time process-scoped override if appropriate:
+or from PowerShell:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\steve\bat\ThumbnailCacheBuilder\Build-ThumbnailCache.ps1"
+& ".\Build-ThumbnailCache.ps1"
 ```
 
-**Default (no `-Paths` argument):** scans all fixed local drives (DriveType=3), prints detected drive paths before scanning, shows each processed file and status in the console, prints per-drive and overall statistics, and writes results continuously to `ThumbnailScan.csv` next to the script. Uses 256px thumbnails, scans drives sequentially with cooldown pauses, and skips Windows/program directories and directory junctions/symlinks. Network drives and removable USB media are not automatically included.
+By default the tool scans all fixed local drives (`DriveType=3`), prints detected drive paths, processes matching files sequentially and writes `ThumbnailScan.csv` next to the script.
 
 ## Extension selection
 
-The scan list is deliberately built from three sources:
+The scan list is built from three sources:
 
-1. a built-in media/image/audio candidate list, so common formats remain covered even when a third-party tool such as Icaros does not register every extension individually;
+1. a built-in media/image/audio candidate list;
 2. explicit document candidates: `pdf`, `doc`, `docx`, `xls`, `xlsx`, `ppt`, `pptx`;
-3. additional extensions detected from registered Windows shell thumbnail handlers (`IThumbnailProvider` and legacy `IExtractImage`), including direct extension mappings, ProgID mappings and `SystemFileAssociations`.
+3. additional extensions detected from registered Windows shell thumbnail handlers (`IThumbnailProvider` and legacy `IExtractImage`).
 
-These sources are merged case-insensitively and de-duplicated. A detected handler still does not guarantee that every file of that type can be rendered successfully.
-
-Use `-ShowDetectedExtensions` to display all extensions discovered from the registry and which of them were not already in the built-in/document lists. Use `-SkipExtensionDiscovery` to skip dynamic registry discovery and use only the built-in plus PDF/Office candidates.
+Use `-ShowDetectedExtensions` to display detected handler types. Use `-SkipExtensionDiscovery` to use only the built-in and document lists.
 
 ### Example startup output
 
-The exact numbers depend on the installed shell extensions and file associations. A real-world startup can look like this:
+The exact counts depend on the Windows installation:
 
 ```text
 Thumbnail handler discovery: 2,03 s
+ThumbnailCacheBuilder 1.1
 Extension sources:
   Built-in media candidates : 112
   PDF/Office candidates     : 7
@@ -52,84 +51,104 @@ Detected scan locations:
   Q:\
   S:\
   W:\
+Request timeout: 15 s
 ```
 
-This makes it immediately visible how much of the scan list comes from the built-in candidates versus the current Windows installation, and how quickly the handler discovery completed.
+## Thumbnail request strategy
+
+Thumbnail extraction runs in a separate `ThumbnailWorker.ps1` process. The worker tries these Windows Shell paths in order:
+
+1. `IShellItemImageFactory`
+2. `IThumbnailCache`
+3. `IShellItem::BindToHandler` + `IThumbnailProvider`
+4. `IShellItem::BindToHandler` + legacy `IExtractImage`
+
+The method that succeeds is written to the console and CSV log.
+
+## Hang protection
+
+Some video codecs and shell extensions can hang indefinitely on a damaged or unusual file. Version 1.1 isolates thumbnail work in a restartable worker process.
+
+The default timeout is 15 seconds per file:
+
+```powershell
+.\Build-ThumbnailCache.ps1 -RequestTimeoutSeconds 15
+```
+
+If a provider stops responding, the worker is terminated, the file is logged as a timeout and scanning continues with a fresh worker:
+
+```text
+[Timeout] D:\Videos\problem.mp4 (WorkerTimeout, TIMEOUT)
+```
+
+Set `-RequestTimeoutSeconds 0` to disable the timeout.
 
 ## Examples
 
 ```powershell
-# No path argument: automatically scan all fixed local drives
+# Automatically scan all fixed local drives
 .\Build-ThumbnailCache.ps1
 
-# Test just one folder
+# Test one directory
 .\Build-ThumbnailCache.ps1 -Paths 'C:\Temp'
 
-# Show dynamically detected shell-thumbnail extensions
+# Show dynamically detected thumbnail extensions
 .\Build-ThumbnailCache.ps1 -Paths 'C:\Temp' -ShowDetectedExtensions
 
 # Skip dynamic registry discovery
 .\Build-ThumbnailCache.ps1 -SkipExtensionDiscovery
 
-# Scan selected drives and write a streaming CSV log
-.\Build-ThumbnailCache.ps1 -Paths 'D:\','E:\' -LogFile 'C:\Temp\ThumbnailScan.csv'
+# Use a shorter timeout for problematic media collections
+.\Build-ThumbnailCache.ps1 -Paths 'D:\Videos' -RequestTimeoutSeconds 8
 
-# Force re-request rather than checking for a cached thumbnail first
+# Force thumbnail generation rather than checking the cache first
 .\Build-ThumbnailCache.ps1 -ForceRefresh -Size 512
 
-# More conservative pauses for large drives
+# Tune throttling
 .\Build-ThumbnailCache.ps1 -DelayMs 200 -BatchSize 50 -BatchPauseMs 10000 -DrivePauseMs 60000
 
 # Include otherwise skipped system/program directories
 .\Build-ThumbnailCache.ps1 -IncludeSystemFolders
 ```
 
-## Thumbnail request strategy
+## Statistics and logging
 
-The normal request path uses `IShellItemImageFactory`. If that route fails, ThumbnailCacheBuilder falls back to the shared Windows `IThumbnailCache` API. This gives Windows another opportunity to invoke the registered thumbnail handler and populate the Explorer cache, which is particularly useful for document formats such as PDF and Office files.
+After each drive the script prints processed, cached, requested, failed, timeout and skipped-directory counts. At the end it displays per-drive and overall totals.
 
-The console and CSV output show which method succeeded (`ImageFactory` or `ThumbnailCache`).
+The CSV log contains one line per processed file with:
 
-## Statistics
+```text
+File,Status,Method,HRESULT
+```
 
-After each drive the script prints its processed, cached, requested, failed and skipped-directory counts. At the end it displays a per-drive summary table and overall totals, plus elapsed time. These counters use constant memory per drive rather than retaining individual file results. The CSV contains individual file statuses.
-
-At startup it also shows extension-source statistics: built-in count, PDF/Office count, detected registered-handler count, newly discovered count and total unique scan types.
+Typical statuses are `Cached`, `Requested`, `Failed` and `Timeout`.
 
 ## Memory and performance
 
-- Processes drives strictly one at a time, waiting 30 seconds between drives by default.
-- Throttles requests: 75 ms per file plus 3 seconds per 100 matching files; tune with `-DelayMs`, `-BatchSize`, `-BatchPauseMs`, `-DrivePauseMs`. This reduces load but cannot enforce a memory limit on third-party providers.
-- Uses direct .NET registry access for dynamic extension discovery instead of recursively walking HKCR through the slower PowerShell registry provider.
-- Iterates files lazily and uses an explicit directory stack instead of recursively loading a full file tree.
-- Writes CSV **incrementally** by default and displays the same status in the console. `-LogFile` overrides the default log location. No per-file results are retained in RAM.
-- Releases native HBITMAP and COM references after every request.
-- A cache-only lookup is attempted first unless `-ForceRefresh` is specified.
-- File-processing errors are isolated so one bad thumbnail request does not abort the remainder of a directory.
-- The directory stack can still grow for very wide trees; Explorer/thumbnail providers may consume memory outside this script.
-- Some codecs or shell extensions may hang or crash independently of the script; test on a small directory first.
+- Drives are processed sequentially.
+- Files are enumerated lazily; a full file tree is not loaded into memory.
+- CSV output is written incrementally.
+- Dynamic extension discovery uses direct .NET registry access for speed.
+- Thumbnail work is isolated from the main scanner process.
+- A hung provider can no longer block the complete scan when the request timeout is enabled.
+- Reparse points are skipped to avoid directory loops.
 
 ## Limitations
 
-- The fallback still relies on the Windows Shell and the thumbnail handlers installed on the machine. A registered handler can be missing, broken or unable to render a particular file.
-- A successful COM call indicates Windows returned or cached a thumbnail; it does not prove Explorer will keep it permanently in cache.
-- Cache-only requests are best-effort and may miss valid thumbnails at different requested sizes.
-- Windows can evict the cache at any time.
-- The extension list is a *candidate filter*, not a guarantee that every format has a working thumbnail provider.
-- This script does not follow directory reparse points, to avoid loops.
-- Large full-disk scans can take hours and produce disk/CPU load. Stop with Ctrl+C.
-- Only use on Windows in an interactive user session. Run from the account whose Explorer thumbnail cache should be warmed.
+- Thumbnail support ultimately depends on the Windows shell providers installed on the machine.
+- A registered provider may still fail for a particular format or file.
+- On the current test system some legacy `.doc` files return `0x8004B200` (`WTS_E_FAILEDEXTRACTION`).
+- On the current test system the PowerToys PDF thumbnail path can return `0x80040154` (`REGDB_E_CLASSNOTREG`) in programmatic extraction even when Explorer can display PDF thumbnails.
+- Windows may evict its thumbnail cache at any time.
+- Large full-disk scans can still take hours. Stop with Ctrl+C.
+- Run the tool in the interactive account whose Explorer thumbnail cache should be warmed.
 
 ## Roadmap
 
-- Further document-handler compatibility where `IShellItemImageFactory` and `IThumbnailCache` are both insufficient
+- Further PDF and legacy Office handler compatibility
 - Optional GUI for Windows
 - Signed and reproducible release builds
 
 ## License
 
 GPL-3.0-or-later; see `LICENSE`.
-
-### Default log path
-
-If `-LogFile` is omitted, the CSV log is written alongside `Build-ThumbnailCache.ps1`. The path is resolved after parameter binding, avoiding empty `$PSScriptRoot` errors.
